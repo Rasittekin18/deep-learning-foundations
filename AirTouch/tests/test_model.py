@@ -6,8 +6,14 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from core.model import AirTouchCNN
-from config import MODELS_DIR, NUM_CLASSES
+from core.model import AirTouchCNN, AirTouchLandmarkNet
+from config import (
+    LANDMARK_FEATURE_DIM,
+    LANDMARK_MODEL_PATH,
+    LANDMARK_NUM_CLASSES,
+    MODELS_DIR,
+    NUM_CLASSES,
+)
 
 class TestModelArchitectureAndGradientFlow:
 
@@ -82,4 +88,41 @@ class TestModelArchitectureAndGradientFlow:
         missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'])
         assert len(missing_keys) == 0, f"Eksik katmanlar var: {missing_keys}"
         assert len(unexpected_keys) == 0, f"Beklenmeyen katmanlar var: {unexpected_keys}"
+
+
+class TestLandmarkNetArchitectureAndCheckpoint:
+
+    def test_landmark_forward_and_probabilities(self):
+        """AirTouchLandmarkNet (B, 88) -> (B, 8) tensör boyutları ve Softmax toplamı 1.0 olmalıdır."""
+        net = AirTouchLandmarkNet(input_dim=LANDMARK_FEATURE_DIM, num_classes=LANDMARK_NUM_CLASSES)
+        net.eval()
+        x = torch.randn(5, LANDMARK_FEATURE_DIM)
+        logits = net(x)
+        probs = net.predict_probabilities(x)
+        assert logits.shape == (5, LANDMARK_NUM_CLASSES)
+        assert probs.shape == (5, LANDMARK_NUM_CLASSES)
+        assert torch.allclose(probs.sum(dim=1), torch.ones(5), atol=1e-5)
+
+    def test_landmark_gradient_flow(self):
+        """AirTouchLandmarkNet geri yayılımda tüm eğitilebilir katmanlara sıfır olmayan gradyan iletmelidir."""
+        net = AirTouchLandmarkNet(input_dim=LANDMARK_FEATURE_DIM, num_classes=LANDMARK_NUM_CLASSES)
+        net.train()
+        x = torch.randn(16, LANDMARK_FEATURE_DIM)
+        y = torch.randint(0, LANDMARK_NUM_CLASSES, (16,))
+        loss = nn.CrossEntropyLoss()(net(x), y)
+        loss.backward()
+        for name, param in net.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"{name} gradyan almadı!"
+                assert param.grad.norm().item() > 0.0, f"{name} gradyanı sıfır!"
+
+    def test_saved_landmark_checkpoint_integrity(self):
+        """Kaydedilen airtouch_landmark_model.pth eksiksiz yüklenmeli ve >=%95 val_acc sunmalıdır."""
+        assert LANDMARK_MODEL_PATH.exists(), "Landmark modeli bulunamadı!"
+        ckpt = torch.load(str(LANDMARK_MODEL_PATH), map_location="cpu")
+        assert ckpt["val_acc"] >= 95.0
+        net = AirTouchLandmarkNet(input_dim=LANDMARK_FEATURE_DIM, num_classes=LANDMARK_NUM_CLASSES)
+        missing, unexpected = net.load_state_dict(ckpt["model_state_dict"])
+        assert len(missing) == 0 and len(unexpected) == 0
+
 

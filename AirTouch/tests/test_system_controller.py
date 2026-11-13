@@ -30,16 +30,34 @@ class TestSystemControllerArchitecture:
         assert VK_MEDIA_PLAY_PAUSE == 0xB3
 
     def test_execute_action_dispatch_valid(self, monkeypatch):
-        """execute_action fonksiyonu geçerli tüm eylemleri ilgili metotlara yönlendirmelidir."""
+        """execute_action fonksiyonu tüm medya, YouTube, sunum ve çift ekran eylemlerini desteklemelidir."""
         ctrl = WindowsSystemController()
-        # Donanıma gerçekten basmayı mockla (güvenli birim testi)
+        # Donanıma gerçekten basmayı ve pencere odağını değiştirmeyi mockla (güvenli birim testi)
         monkeypatch.setattr(ctrl, "_press_key", lambda code: None)
-        
-        valid_actions = ["play_pause", "volume_up", "volume_down", "next_track", "prev_track", "mute"]
+        monkeypatch.setattr(ctrl, "_press_combo", lambda mods, code: None)
+        monkeypatch.setattr(ctrl, "_scroll_wheel", lambda delta: None)
+        monkeypatch.setattr(ctrl, "_prepare_user_focus", lambda: None)
+
+        from core import system_controller as sc_mod
+        monkeypatch.setattr(sc_mod.window_manager, "switch_next_app", lambda reverse=False: (True, "Mock:AppSwitch"))
+        monkeypatch.setattr(sc_mod.window_manager, "focus_other_screen", lambda: (True, "Mock:OtherScreen"))
+        monkeypatch.setattr(sc_mod.window_manager, "focus_app_by_keywords", lambda kws, display_name="Uyg": (True, f"Mock:{display_name}"))
+
+        valid_actions = [
+            "play_pause", "volume_up", "volume_down", "next_track",
+            "prev_track", "mute", "fullscreen", "next_slide",
+            "prev_slide", "space_play", "scroll_up", "scroll_down", "esc",
+            "yt_forward_10", "yt_rewind_10", "yt_next_video", "yt_captions",
+            "next_app", "prev_app", "focus_other_screen", "move_window_other_screen",
+            "browser_next_tab", "browser_prev_tab", "focus_youtube", "focus_spotify",
+            "snap_left", "snap_right",
+        ]
         for action in valid_actions:
             result = ctrl.execute_action(action)
             assert result is not None
             assert isinstance(result, str)
+
+        assert ctrl.execute_action("none") is None
 
     def test_execute_action_dispatch_invalid(self):
         """Tanımsız bir eylem istendiğinde hata fırlatmadan None dönmelidir."""

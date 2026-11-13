@@ -39,7 +39,7 @@ Bu depo; yapay sinir ağlarının matematiksel ve algoritmik temellerinden başl
 | 03 | **Deep Learning for Image Processing** | OpenCV ile nesne tespiti ve takibi, CNN tabanlı özellik çıkarımı ve nesne sınıflandırma modelleri. | CNN, Object Tracking, OpenCV, PyTorch | [`/8-Deep-Learning-for-Image-Processing`](./8-Deep-Learning-for-Image-Processing) |
 | 04 | **MNIST Trainable Denoiser** | Gaussian veya rastgele gürültü eklenmiş el yazısı rakam görüntülerini temizleyen ve orijinal haline yeniden yapılandıran Evrişimli Oto-kodlayıcı (Convolutional Denoising AutoEncoder). | AutoEncoder, Encoder-Decoder, MSE Loss | [`/MNIST-Trainable-Denoiser`](./MNIST-Trainable-Denoiser) |
 | 05 | **MNIST Digit Difference Predictor** | İki el yazısı rakamı girdi alarak hem her iki rakamı aynı anda tanıyan hem de aralarındaki mutlak matematiksel farkı tahmin eden çok görevli (multi-task) sinir ağı. | Multi-output Neural Network, Classification & Regression | [`/mnist-digit-diff`](./mnist-digit-diff) |
-| 06 | **AirTouch: Touchless Media Controller** | Web veya telefon kamerası (IP Webcam) akışı üzerinden el hareketlerini gerçek zamanlı tanıyıp YouTube, Spotify ve Windows medya/ses sistemini temassız yöneten PyTorch CNN asistanı. | PyTorch CNN, OpenCV 60 FPS, Streamlit, Auto-Hand Tracking | [`/AirTouch`](./AirTouch) |
+| 06 | **AirTouch v2.1 Pro** | Laptop varsayılan kamerasıyla MediaPipe 21-nokta el iskeleti + PyTorch LandmarkNet ve çevrimdışı Vosk Türkçe sesli komutlar üzerinden YouTube, medya ve çift ekran kontrolü sunan temassız asistan. | MediaPipe HandLandmarker, PyTorch MLP & CNN, Vosk TR Voice, Streamlit | [`/AirTouch`](./AirTouch) |
 
 ---
 

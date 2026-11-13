@@ -1,447 +1,501 @@
 """
-AirTouch 60 FPS Canlı Masaüstü Kamera Penceresi (live_desktop_cam.py)
-Özellikler:
-1. 🤖 Otomatik El Takibi (Auto-Tracking): Kutu otomatik olarak elinizi bulur ve takip eder.
-2. 📐 Genişletilmiş BBox (340x340 px): Artık elinizi küçük bir kutuya sığdırmaya çalışmak yok!
-3. 🛡️ Akıllı 4 Katmanlı Karar Mimarisi (El varlık kapısı, hold-to-confirm, one-shot kilitlenme).
+AirTouch Kesintisiz Canlı Masaüstü Kamera, Sesli Komut ve Çift Ekran Kontrolcüsü (live_desktop_cam.py)
+Normal laptop varsayılan kamerası (index 0) + mikrofon üzerinden çalışır:
+- 21 Eklemli El İskeleti AI + Ekranda Canlı "Hangi Parmak Ne Yapar?" Rehberi
+- Çevrimdışı Türkçe Sesli Komutlar (Vosk) + YouTube/Medya/Çift Ekran Geçişi
+- Çift Monitör Desteği ([W] Ekran Taşı), Mini PiP Modu ([C]) ve Sistem Tepsisi (Tray)
 """
+from __future__ import annotations
+
+import argparse
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
-import numpy as np
-import torch
-import cv2
+from typing import Any, Dict, Optional
 
-# Proje dizinini sys.path'e ekle
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw
+
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from config import (
-    MODELS_DIR, 
-    GESTURE_NAMES, 
-    GESTURE_ACTIONS, 
-    DEFAULT_CONFIDENCE_THRESHOLD, 
-    DEFAULT_COOLDOWN_SECONDS
+    ACTION_PROFILES,
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_COOLDOWN_SECONDS,
+    DEFAULT_GESTURE_GUARD_MODE,
+    DEFAULT_MAX_HAND_MOTION,
+    DEFAULT_MIN_MARGIN,
+    DEFAULT_PALM_ARM_SECONDS,
+    DEFAULT_STABLE_FRAMES,
 )
-from core.model import AirTouchCNN
+from core.camera import CameraStream, apply_low_light_boost, parse_camera_source
+from core.engine import AirTouchEngine
+from core.settings import SettingsManager
 from core.system_controller import system_controller
+from core.voice_commander import VoiceCommander, resolve_best_input_device, sound_feedback
+from core.window_manager import window_manager
 
-def detect_hand_presence(hand_bgr, min_skin_ratio=0.10):
-    """
-    YCrCb renk uzayında kutu içinde ten rengi yoğunluğunu kontrol eder.
-    """
-    if hand_bgr is None or hand_bgr.size == 0 or hand_bgr.shape[0] < 10 or hand_bgr.shape[1] < 10:
-        return False, 0.0
-    ycrcb = cv2.cvtColor(hand_bgr, cv2.COLOR_BGR2YCrCb)
-    skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-    total_pixels = hand_bgr.shape[0] * hand_bgr.shape[1]
-    skin_pixels = np.count_nonzero(skin_mask)
-    ratio = float(skin_pixels) / float(total_pixels)
-    return (ratio >= min_skin_ratio), ratio
+WINDOW_TITLE = "AirTouch - Canli Masaustu Kontrol (G: Rehber | K: El Kapi | V: Ses | C: Mini | W: Ekran | Q: Cikis)"
 
-def find_hand_in_frame(frame, min_area=3000, max_area=85000):
-    """
-    Kare içindeki kaldırılmış eli (en belirgin ve yüksek ten bloğunu) otomatik bulur.
-    Döndürür: (found, target_center_x, target_center_y, target_size)
-    """
-    h, w, _ = frame.shape
-    # Arama bölgesini sınırla (Kenar parazitlerini ve aşırı alt gövdeyi ele)
-    search_x1 = int(w * 0.08)
-    search_x2 = int(w * 0.92)
-    search_y1 = int(h * 0.05)
-    search_y2 = int(h * 0.90)
 
-    search_roi = frame[search_y1:search_y2, search_x1:search_x2]
-    ycrcb = cv2.cvtColor(search_roi, cv2.COLOR_BGR2YCrCb)
-    skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
+def _sync_engine_with_settings(engine: AirTouchEngine, settings_mgr: SettingsManager):
+    cfg = settings_mgr.data
+    mode = cfg.get("engine_mode", "landmark")
+    if mode != engine.engine_mode:
+        engine.set_mode(mode)
 
-    contours, _ = cv2.findContours(skin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    engine.confidence_threshold = float(cfg.get("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD))
+    engine.cooldown_seconds = float(cfg.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS))
+    engine.required_stable_frames = int(cfg.get("required_stable_frames", DEFAULT_STABLE_FRAMES))
+    engine.min_margin = float(cfg.get("min_margin", DEFAULT_MIN_MARGIN))
+    engine.guard_mode = str(cfg.get("gesture_guard_mode", DEFAULT_GESTURE_GUARD_MODE))
+    engine.strict_neutral_reset = bool(cfg.get("strict_neutral_reset", True))
+    engine.max_hand_motion = float(cfg.get("max_hand_motion", DEFAULT_MAX_HAND_MOTION))
+    engine.palm_arm_seconds = float(cfg.get("palm_arm_seconds", DEFAULT_PALM_ARM_SECONDS))
+    engine.show_skeleton = bool(cfg.get("show_skeleton", True))
+    engine.gesture_actions = settings_mgr.get_actions_map(engine.engine_mode)
 
-    candidates = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if min_area < area < max_area:
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            # Alt kenara yapışık devasa gövde bloklarını ele
-            if by + bh >= (search_y2 - search_y1 - 15) and bw > (w * 0.40):
-                continue
-            gx = search_x1 + bx
-            gy = search_y1 + by
-            candidates.append((area, gx, gy, bw, bh))
+    prof_key = cfg.get("active_profile", "media")
+    prof_info = ACTION_PROFILES.get(prof_key, {})
+    engine.profile_label = prof_info.get("short_name", "Ozel")
 
-    if not candidates:
-        return False, None, None, None
 
-    # En yukarıda olan (en küçük gy koordinatlı kaldırılmış el) adayını seç
-    best_cand = min(candidates, key=lambda item: item[2])
-    area, gx, gy, bw, bh = best_cand
+def _create_tray_icon_image() -> Image.Image:
+    img = Image.new("RGBA", (64, 64), (16, 22, 34, 255))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=(18, 28, 44, 255), outline=(0, 215, 255, 255), width=3)
+    d.ellipse([20, 22, 44, 48], fill=(0, 215, 255, 230))
+    for fx in (17, 25, 33, 41):
+        d.rounded_rectangle([fx, 11, fx + 5, 26], radius=2, fill=(0, 235, 140, 255))
+    return img
 
-    cx = gx + bw // 2
-    cy = gy + bh // 2
-    # Cömert ve geniş boyutlandırma
-    hand_size = int(max(bw, bh) * 1.45)
-    hand_size = max(260, min(min(w, h) - 50, hand_size))
 
-    return True, cx, cy, hand_size
+def _start_system_tray(cmd_queue: "queue.Queue[str]"):
+    try:
+        import pystray
+    except Exception:
+        return None
 
-def run_live_desktop_camera(camera_source="http://192.168.1.15:8080/video"):
-    if len(sys.argv) > 1 and sys.argv[1].strip():
-        arg_source = sys.argv[1].strip()
-        if arg_source.isdigit():
-            camera_source = int(arg_source)
-        else:
-            camera_source = arg_source
-            if not camera_source.endswith("/video") and "http" in camera_source and ":8080" in camera_source:
-                camera_source = camera_source.rstrip("/") + "/video"
+    def _emit(cmd: str):
+        def _handler(icon, item):
+            try:
+                cmd_queue.put_nowait(cmd)
+            except queue.Full:
+                pass
 
-    print("=" * 70)
-    print("🖐️ AirTouch Akıllı & Otomatik Takipli El Kumandası Başlatılıyor...")
-    print(f"Kamera Kaynağı: {camera_source}")
-    print("YENİ ÖZELLİKLER:")
-    print("  ⭐ OTOMATİK EL TAKİBİ: Kutu otomatik olarak elinize kilitlenir!")
-    print("     (Elinizi kutunun içine denk getirmeye uğraşmanıza gerek yok)")
-    print("  ⭐ GENİŞ BOYUT: Kutu varsayılan olarak %85 daha geniş (340x340 px).")
-    print("  ⭐ ONE-SHOT LATCH: Tek harekette yalnızca 1 kez basar, kilitleyip bekler.")
-    print("Kontroller:")
-    print("  - [SPACE]: Otomatik El Takibini Aç / Kapat (Açıkken elinizi takip eder)")
-    print("  - [1 / 2 / 3]: Kutu Boyutu (1: 280px, 2: 340px Geniş, 3: 420px Devasa)")
-    print("  - [+ / -]: Boyutu serbestçe büyüt / küçült")
-    print("  - [W / A / S / D]: Manuel modda kutuyu taşı")
-    print("  - [T]: Güven Eşiğini Değiştir (%70 / %75 / %80)")
-    print("  - [Q / ESC]: Çıkış")
-    print("=" * 70)
+        return _handler
 
-    # 1. Modeli Yükle
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = AirTouchCNN(num_classes=10).to(device)
-    model_path = MODELS_DIR / "airtouch_model.pth"
-    
-    if model_path.exists():
-        checkpoint = torch.load(str(model_path), map_location=device)
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        model.load_state_dict(state_dict)
-        val_acc = checkpoint.get('val_acc', 98.71)
-        print(f"✅ Model başarıyla yüklendi (Doğruluk: %{val_acc:.2f})")
-    else:
-        print("❌ HATA: airtouch_model.pth bulunamadı!")
+    menu = pystray.Menu(
+        pystray.MenuItem("Pencereyi Göster / Gizle", _emit("toggle_hidden")),
+        pystray.MenuItem("Mini PiP Modu Aç / Kapat", _emit("toggle_compact")),
+        pystray.MenuItem("Diğer Ekrana Taşı", _emit("switch_monitor")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("El Takibini Duraklat / Devam", _emit("toggle_pause")),
+        pystray.MenuItem("El Güvenlik Kapısı (Avuç / Direkt / Sadece Ses)", _emit("cycle_guard")),
+        pystray.MenuItem("Sesli Komut Aç / Kapat", _emit("toggle_voice")),
+        pystray.MenuItem("Profil Değiştir", _emit("cycle_profile")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Çıkış", _emit("quit")),
+    )
+    icon = pystray.Icon("AirTouch", _create_tray_icon_image(), "AirTouch Kontrol", menu)
+    t = threading.Thread(target=icon.run, daemon=True)
+    t.start()
+    return icon
+
+
+def _set_window_visibility(window_title: str, visible: bool):
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    hwnd = ctypes.windll.user32.FindWindowW(None, window_title)
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 5 if visible else 0)
+
+
+def _apply_window_layout(
+    window_title: str,
+    compact_mode: bool,
+    always_on_top: bool,
+    monitor_index: int,
+):
+    w, h = (420, 255) if compact_mode else (960, 540)
+    corner = "bottom_right" if compact_mode else "top_right"
+    placed_mon = window_manager.position_window_on_monitor(
+        window_title, monitor_index=monitor_index, width=w, height=h, corner=corner
+    )
+    top_flag = 1.0 if (always_on_top or compact_mode) else 0.0
+    try:
+        cv2.setWindowProperty(window_title, cv2.WND_PROP_TOPMOST, top_flag)
+    except Exception:
+        pass
+    return placed_mon
+
+
+def run_live_desktop_camera(
+    camera_source: Optional[str] = None,
+    monitor_index: Optional[int] = None,
+    compact_override: Optional[bool] = None,
+    voice_override: Optional[bool] = None,
+):
+    settings_mgr = SettingsManager()
+    cfg = settings_mgr.data
+
+    resolved_source = (
+        parse_camera_source(camera_source)
+        if camera_source is not None
+        else parse_camera_source(cfg.get("camera_source", 0))
+    )
+    if monitor_index is not None:
+        cfg["hud_monitor_index"] = int(monitor_index)
+    if compact_override is not None:
+        cfg["hud_compact_mode"] = bool(compact_override)
+    if voice_override is not None:
+        cfg["voice_enabled"] = bool(voice_override)
+
+    monitors = window_manager.get_monitors()
+    best_mic = resolve_best_input_device(cfg.get("mic_device_index"))
+    mic_desc = f"[{best_mic['index']}] {best_mic['name']}" if best_mic else "Bulunamadı"
+    print("=" * 74)
+    print("AirTouch v2.1 Pro — Masaüstü Canlı Kamera, Çift Ekran & Sesli Komut")
+    print(f"Kamera: Laptop ({resolved_source}) | Ekran Sayısı: {len(monitors)} | Mikrofon: {mic_desc}")
+    print("Kısayollar:")
+    print("  [K] El Güvenlik Kapısı (Avuç / Direkt / Sadece Ses)  [G] Parmak Rehberi")
+    print("  [V] Sesli Komut  [C] Mini PiP  [W] Ekran Taşı  [M] Profil  [SPACE] Bekle  [Q] Çık")
+    print("=" * 74)
+
+    engine = AirTouchEngine(
+        engine_mode=cfg.get("engine_mode", "landmark"),
+        confidence_threshold=cfg.get("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD),
+        cooldown_seconds=cfg.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS),
+        required_stable_frames=cfg.get("required_stable_frames", DEFAULT_STABLE_FRAMES),
+        min_margin=cfg.get("min_margin", DEFAULT_MIN_MARGIN),
+        guard_mode=cfg.get("gesture_guard_mode", DEFAULT_GESTURE_GUARD_MODE),
+        strict_neutral_reset=bool(cfg.get("strict_neutral_reset", True)),
+        max_hand_motion=float(cfg.get("max_hand_motion", DEFAULT_MAX_HAND_MOTION)),
+        palm_arm_seconds=float(cfg.get("palm_arm_seconds", DEFAULT_PALM_ARM_SECONDS)),
+        running_mode="VIDEO",
+    )
+    _sync_engine_with_settings(engine, settings_mgr)
+
+    cam = CameraStream(source=resolved_source, width=960, height=540)
+    if not cam.start():
+        print(f"\n[HATA] Kamera açılamadı (Kaynak: {resolved_source})!")
+        print("İpucu: Başka bir uygulama (Zoom, tarayıcı sekmesi vb.) kamerayı kullanıyor olabilir.")
+        engine.close()
         return
 
-    model.eval()
+    # Sesli Komut Başlat
+    voice_enabled = bool(cfg.get("voice_enabled", True))
+    voice_cmd: Optional[VoiceCommander] = None
+    if voice_enabled:
+        voice_cmd = VoiceCommander(
+            engine=cfg.get("voice_engine", "vosk"),
+            wake_required=bool(cfg.get("voice_wake_required", False)),
+            mic_device_index=cfg.get("mic_device_index"),
+        )
+        voice_cmd.start()
 
-    # 2. Kamera Bağlantısı
-    print(f"Kameraya bağlanılıyor: {camera_source} ...")
-    cap = cv2.VideoCapture(camera_source)
-    
-    if not cap.isOpened():
-        print(f"\n❌ HATA: Kamera açılamadı: '{camera_source}'!")
-        return
+    tray_q: "queue.Queue[str]" = queue.Queue(maxsize=16)
+    tray_icon = _start_system_tray(tray_q)
 
-    TARGET_W = 960
-    TARGET_H = 540
-    WINDOW_TITLE = "AirTouch - Otomatik Takipli El Kumandasi (SPACE: Oto-Takip | 1/2/3: Boyut)"
-    
+    compact_mode = bool(cfg.get("hud_compact_mode", False))
+    show_guide = bool(cfg.get("show_gesture_guide", True))
+    always_on_top = bool(cfg.get("always_on_top", False))
+    hud_monitor = int(cfg.get("hud_monitor_index", 1))
+    auto_context = bool(cfg.get("auto_context_profile", False))
+    sound_on = bool(cfg.get("sound_feedback", True))
+    window_hidden = False
+
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_TITLE, TARGET_W, TARGET_H)
+    hud_monitor = _apply_window_layout(WINDOW_TITLE, compact_mode, always_on_top, hud_monitor)
 
-    # Kutu Boyutları & Pozisyonu (Varsayılan Geniş Boyut: 340x340 px)
-    auto_track = True           # Otomatik takip varsayılan olarak AÇIK!
-    box_size = 340.0
-    box_cx = float(TARGET_W // 2)
-    box_cy = float(TARGET_H // 2)
+    profile_keys = list(ACTION_PROFILES.keys())
+    last_settings_check = time.time()
+    last_context_check = 0.0
+    last_seen_ctx_hwnd: Optional[int] = None
+    last_seen_ctx_type: Optional[str] = None
+    target_ctx: Dict[str, Any] = window_manager.update_last_user_window()
+    fps_smooth = 30.0
+    prev_t = time.perf_counter()
 
-    # Akıllı Durum Makinesi
-    REQUIRED_STABLE_FRAMES = 5
-    ONE_SHOT_ACTIONS = {"play_pause", "next_track", "prev_track", "mute"}
-    STEP_ACTIONS = {"volume_up", "volume_down"}
-    STEP_COOLDOWN = 0.95
+    def _switch_profile(new_prof: str, announce: str = ""):
+        nonlocal cfg
+        if new_prof not in ACTION_PROFILES:
+            return
+        cfg = settings_mgr.apply_profile(new_prof)
+        _sync_engine_with_settings(engine, settings_mgr)
+        sound_feedback.play("profile", enabled=sound_on)
+        print(f"Aktif Profil: {ACTION_PROFILES[new_prof]['name']} {announce}".strip())
 
-    confidence_threshold = 0.75
-    min_margin = 0.28
+    def _handle_meta(kind: str):
+        nonlocal compact_mode, show_guide, hud_monitor, window_hidden, cfg, voice_enabled, voice_cmd
+        if kind == "pause":
+            engine.paused = True
+            engine.reset_state()
+            sound_feedback.play("pause", enabled=sound_on)
+        elif kind == "resume":
+            engine.paused = False
+            engine.reset_state()
+            sound_feedback.play("voice", enabled=sound_on)
+        elif kind == "toggle_pause":
+            engine.paused = not engine.paused
+            engine.reset_state()
+            sound_feedback.play("pause" if engine.paused else "voice", enabled=sound_on)
+        elif kind in ("compact_on", "compact_off", "toggle_compact"):
+            compact_mode = True if kind == "compact_on" else (False if kind == "compact_off" else not compact_mode)
+            cfg["hud_compact_mode"] = compact_mode
+            settings_mgr.save(cfg)
+            hud_monitor = _apply_window_layout(WINDOW_TITLE, compact_mode, always_on_top, hud_monitor)
+        elif kind == "guide_toggle":
+            show_guide = not show_guide
+            cfg["show_gesture_guide"] = show_guide
+            settings_mgr.save(cfg)
+        elif kind in ("switch_hud_monitor", "switch_monitor"):
+            mons = window_manager.get_monitors()
+            hud_monitor = (hud_monitor % max(1, len(mons))) + 1
+            cfg["hud_monitor_index"] = hud_monitor
+            settings_mgr.save(cfg)
+            hud_monitor = _apply_window_layout(WINDOW_TITLE, compact_mode, always_on_top, hud_monitor)
+        elif kind == "toggle_hidden":
+            window_hidden = not window_hidden
+            _set_window_visibility(WINDOW_TITLE, not window_hidden)
+        elif kind == "toggle_voice":
+            voice_enabled = not voice_enabled
+            cfg["voice_enabled"] = voice_enabled
+            settings_mgr.save(cfg)
+            if voice_enabled:
+                if voice_cmd is None:
+                    voice_cmd = VoiceCommander(
+                        engine=cfg.get("voice_engine", "vosk"),
+                        wake_required=bool(cfg.get("voice_wake_required", False)),
+                        mic_device_index=cfg.get("mic_device_index"),
+                    )
+                    voice_cmd.start()
+            elif voice_cmd is not None:
+                voice_cmd.stop()
+                voice_cmd = None
+        elif kind == "cycle_profile":
+            curr_p = cfg.get("active_profile", "media")
+            idx = profile_keys.index(curr_p) if curr_p in profile_keys else 0
+            _switch_profile(profile_keys[(idx + 1) % len(profile_keys)])
+        elif kind == "cycle_guard":
+            guards = ["palm_arm", "strict_reset", "voice_only"]
+            cur_g = cfg.get("gesture_guard_mode", DEFAULT_GESTURE_GUARD_MODE)
+            nxt_g = guards[(guards.index(cur_g) + 1) % len(guards)] if cur_g in guards else "palm_arm"
+            cfg["gesture_guard_mode"] = nxt_g
+            settings_mgr.save(cfg)
+            engine.guard_mode = nxt_g
+            engine.reset_state()
+            labels_g = {"palm_arm": "Avuç Kapısı", "strict_reset": "Doğrudan + Kilit", "voice_only": "Sadece Ses"}
+            sound_feedback.play("profile", enabled=sound_on)
+            print(f"El Güvenlik Kapısı: {labels_g.get(nxt_g, nxt_g)}")
 
-    candidate_class = None
-    stable_count = 0
-    latched = False
-    latched_gesture = None
-    last_step_trigger_time = 0.0
-    last_action_message = None
-    flash_timer = 0.0
+    try:
+        while True:
+            ret, raw_bgr = cam.read()
+            if not ret or raw_bgr is None:
+                time.sleep(0.015)
+                if (cv2.waitKey(10) & 0xFF) in (ord("q"), ord("Q"), 27):
+                    break
+                continue
 
-    print("AirTouch hazır. Elinizi kameranın önüne kaldırın!")
+            now_wall = time.time()
 
-    while True:
-        ret, raw_frame = cap.read()
-        if not ret or raw_frame is None:
-            time.sleep(0.2)
-            k = cv2.waitKey(10) & 0xFF
-            if k in (ord('q'), ord('Q'), 27):
+            # 1. Aktif pencere / ekran bağlamı & otomatik profil önerisi
+            if now_wall - last_context_check >= 0.25:
+                last_context_check = now_wall
+                target_ctx = window_manager.update_last_user_window()
+                if auto_context and target_ctx.get("hwnd"):
+                    ctx_hwnd = target_ctx["hwnd"]
+                    ctx_type = target_ctx.get("context", "workspace")
+                    if ctx_hwnd != last_seen_ctx_hwnd or ctx_type != last_seen_ctx_type:
+                        last_seen_ctx_hwnd = ctx_hwnd
+                        last_seen_ctx_type = ctx_type
+                        if ctx_type in ACTION_PROFILES and ctx_type != cfg.get("active_profile"):
+                            _switch_profile(ctx_type, announce="(Oto-Bağlam)")
+
+            # 2. settings.json canlı senkronizasyon
+            if now_wall - last_settings_check >= 0.5:
+                last_settings_check = now_wall
+                if settings_mgr.reload_if_changed():
+                    _sync_engine_with_settings(engine, settings_mgr)
+                    cfg = settings_mgr.data
+                    show_guide = bool(cfg.get("show_gesture_guide", True))
+                    sound_on = bool(cfg.get("sound_feedback", True))
+                    auto_context = bool(cfg.get("auto_context_profile", False))
+                    if voice_cmd is not None:
+                        voice_cmd.wake_required = bool(cfg.get("voice_wake_required", False))
+
+            # 3. Sistem tepsisi menü komutları
+            quit_requested = False
+            while True:
+                try:
+                    t_cmd = tray_q.get_nowait()
+                except queue.Empty:
+                    break
+                if t_cmd == "quit":
+                    quit_requested = True
+                    break
+                _handle_meta(t_cmd)
+            if quit_requested:
                 break
-            continue
 
-        frame = cv2.resize(raw_frame, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
-        now = time.time()
+            # 4. Sesli komutları tüket ve çalıştır
+            if voice_cmd is not None:
+                v_evt = voice_cmd.pop_command()
+                if v_evt is not None:
+                    v_type = v_evt["type"]
+                    v_tgt = v_evt["target"]
+                    if v_type == "youtube_play" and bool(cfg.get("trigger_enabled", True)):
+                        res_msg = system_controller.open_youtube_video(v_evt.get("query", ""))
+                        engine.last_action_message = f"[Ses] {res_msg}"
+                        engine.total_triggers += 1
+                        sound_feedback.play("voice", enabled=sound_on)
+                        print(f"[SES KOMUTU] '{v_evt['heard_text']}' -> {res_msg}")
+                    elif v_type == "action" and bool(cfg.get("trigger_enabled", True)):
+                        res_msg = system_controller.execute_action(v_tgt)
+                        if res_msg:
+                            engine.last_action_message = f"[Ses] {res_msg}"
+                            engine.total_triggers += 1
+                            sound_feedback.play("voice", enabled=sound_on)
+                            print(f"[SES KOMUTU] '{v_evt['heard_text']}' -> {res_msg}")
+                    elif v_type == "profile":
+                        _switch_profile(v_tgt, announce="(Ses Komutu)")
+                    elif v_type == "meta":
+                        _handle_meta(v_tgt)
 
-        # ==================== 1. OTOMATİK EL TAKİBİ ====================
-        hand_auto_found = False
-        if auto_track:
-            found, target_cx, target_cy, target_sz = find_hand_in_frame(frame)
-            if found:
-                hand_auto_found = True
-                # Yumuşak Takip (EMA Filtresi - Sarsıntısız ve akıcı geçiş)
-                alpha = 0.35
-                box_cx = (1.0 - alpha) * box_cx + alpha * float(target_cx)
-                box_cy = (1.0 - alpha) * box_cy + alpha * float(target_cy)
-                box_size = (1.0 - alpha) * box_size + alpha * float(target_sz)
+            # 5. Kamera karesi işle
+            target_w, target_h = (420, 255) if compact_mode else (960, 540)
+            frame_bgr = cv2.resize(raw_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            if cfg.get("mirror_camera", True):
+                frame_bgr = cv2.flip(frame_bgr, 1)
 
-        # Sınır kontrolleri
-        box_size = max(200.0, min(float(min(w, h) - 40), box_size))
-        half_s = box_size / 2.0
-        box_cx = max(half_s + 10, min(w - half_s - 10, box_cx))
-        box_cy = max(half_s + 50, min(h - half_s - 25, box_cy))
+            if cfg.get("low_light_boost", True):
+                frame_bgr, _ = apply_low_light_boost(frame_bgr)
 
-        x1 = int(box_cx - half_s)
-        y1 = int(box_cy - half_s)
-        x2 = int(box_cx + half_s)
-        y2 = int(box_cy + half_s)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        hand_roi = frame[y1:y2, x1:x2]
+            cur_t = time.perf_counter()
+            dt = max(1e-4, cur_t - prev_t)
+            prev_t = cur_t
+            fps_smooth = 0.85 * fps_smooth + 0.15 * (1.0 / dt)
 
-        # ==================== 2. EL VARLIK KONTROLÜ ====================
-        has_hand, skin_ratio = detect_hand_presence(hand_roi, min_skin_ratio=0.09)
-
-        pred_class = None
-        confidence = 0.0
-        action_name = None
-        class_name = "El Yok"
-        action_executed = None
-        progress = 0.0
-        norm_roi = np.zeros((64, 64), dtype=np.float32)
-
-        if not has_hand and not hand_auto_found:
-            stable_count = 0
-            candidate_class = None
-            latched = False
-            latched_gesture = None
-            status_text = "ELINIZI KALDIRIN (KUTU OTOMATIK YAKALAR)"
-            status_state = "EMPTY"
-        else:
-            # Model Çıkarımı
-            gray_roi = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2GRAY)
-            resized_roi = cv2.resize(gray_roi, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
-
-            p_min, p_max = np.percentile(resized_roi, (2, 98))
-            if p_max > p_min + 1e-4:
-                norm_roi = (resized_roi - p_min) / (p_max - p_min)
-                norm_roi = np.clip(norm_roi, 0.0, 1.0)
+            v_status = voice_cmd.get_status() if voice_cmd is not None else {"running": False, "available": False, "mic_level": 0.0}
+            guard_tags = {"palm_arm": "AVUC", "strict_reset": "DIREKT", "voice_only": "SALT-SES"}
+            g_tag = guard_tags.get(engine.guard_mode, "AVUC")
+            if compact_mode:
+                footer_hint = f"[K] {g_tag} | [C] Genis | [W] Ekran | [V] Ses | [Q] Cikis"
             else:
-                norm_roi = resized_roi / 255.0
+                pause_str = "BEKLE" if engine.paused else "AKTIF"
+                footer_hint = (
+                    f"[K] Kapi:{g_tag} | [G] Rehber | [V] Ses:{'ACIK' if voice_enabled else 'KAPALI'} | "
+                    f"[C] Mini | [W] Ekran:{hud_monitor} | [M] Profil | [SPACE] {pause_str} | [Q] Cikis"
+                )
 
-            tensor = torch.tensor(norm_roi, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+            report = engine.process_frame(
+                frame_rgb,
+                trigger_enabled=bool(cfg.get("trigger_enabled", True)),
+                fps=fps_smooth,
+                footer_hint=footer_hint,
+                voice_status=v_status,
+                target_context=target_ctx,
+                show_guide=show_guide,
+                compact_mode=compact_mode,
+            )
 
-            with torch.no_grad():
-                probs = model.predict_probabilities(tensor).cpu().numpy()[0]
+            if report.get("action_executed"):
+                sound_feedback.play("action", enabled=sound_on)
+            elif report.get("arm_just_activated"):
+                sound_feedback.play("arm", enabled=sound_on)
 
-            sorted_indices = np.argsort(probs)[::-1]
-            top1 = int(sorted_indices[0])
-            top2 = int(sorted_indices[1])
-            confidence = float(probs[top1])
-            margin = float(probs[top1] - probs[top2])
-            pred_class = top1
+            if not window_hidden:
+                hud_bgr = cv2.cvtColor(np.asarray(report["annotated_frame"]), cv2.COLOR_RGB2BGR)
+                cv2.imshow(WINDOW_TITLE, hud_bgr)
+                try:
+                    if cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+                except Exception:
+                    break
 
-            class_name = GESTURE_NAMES.get(pred_class, f"İşaret {pred_class}")
-            action_name = GESTURE_ACTIONS.get(pred_class, None)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            elif key == 32:  # SPACE
+                _handle_meta("toggle_pause")
+            elif key in (ord("k"), ord("K")):
+                _handle_meta("cycle_guard")
+            elif key in (ord("m"), ord("M")):
+                _handle_meta("cycle_profile")
+            elif key in (ord("g"), ord("G")):
+                _handle_meta("guide_toggle")
+            elif key in (ord("c"), ord("C")):
+                _handle_meta("toggle_compact")
+            elif key in (ord("w"), ord("W")):
+                _handle_meta("switch_hud_monitor")
+            elif key in (ord("v"), ord("V")):
+                _handle_meta("toggle_voice")
+            elif key in (ord("z"), ord("Z")):
+                _handle_meta("toggle_hidden")
+            elif key in (ord("x"), ord("X")):
+                auto_context = not auto_context
+                cfg["auto_context_profile"] = auto_context
+                settings_mgr.save(cfg)
+                print(f"Otomatik Bağlam Profili: {'AÇIK' if auto_context else 'KAPALI'}")
+            elif key in (ord("h"), ord("H")):
+                cfg["show_skeleton"] = not bool(cfg.get("show_skeleton", True))
+                settings_mgr.save(cfg)
+                engine.show_skeleton = cfg["show_skeleton"]
+            elif key in (ord("l"), ord("L")):
+                cfg["low_light_boost"] = not bool(cfg.get("low_light_boost", True))
+                settings_mgr.save(cfg)
+            elif key in (ord("a"), ord("A")):
+                always_on_top = not always_on_top
+                cfg["always_on_top"] = always_on_top
+                settings_mgr.save(cfg)
+                _apply_window_layout(WINDOW_TITLE, compact_mode, always_on_top, hud_monitor)
+            elif key in (ord("t"), ord("T")):
+                thresholds = [0.65, 0.72, 0.82]
+                cur = round(float(engine.confidence_threshold), 2)
+                nxt = thresholds[(thresholds.index(cur) + 1) % len(thresholds)] if cur in thresholds else 0.72
+                cfg["confidence_threshold"] = nxt
+                settings_mgr.save(cfg)
+                engine.confidence_threshold = nxt
+    finally:
+        if tray_icon is not None:
+            try:
+                tray_icon.stop()
+            except Exception:
+                pass
+        if voice_cmd is not None:
+            voice_cmd.stop()
+        cam.stop()
+        engine.close()
+        cv2.destroyAllWindows()
+        print("AirTouch canlı masaüstü penceresi kapatıldı.")
 
-            is_quality = (confidence >= confidence_threshold) and (margin >= min_margin)
-
-            if not is_quality:
-                stable_count = max(0, stable_count - 1)
-                status_text = f"Hareketi Tutun (%{confidence * 100:.0f})"
-                status_state = "UNCERTAIN"
-            else:
-                if latched and latched_gesture == pred_class:
-                    status_text = f"KILITLENDI: {class_name} (Yeni komut icin elinizi indirin)"
-                    status_state = "LATCHED"
-                    progress = 1.0
-                else:
-                    if candidate_class == pred_class:
-                        stable_count += 1
-                    else:
-                        candidate_class = pred_class
-                        stable_count = 1
-                        latched = False
-
-                    progress = min(1.0, stable_count / REQUIRED_STABLE_FRAMES)
-
-                    if stable_count >= REQUIRED_STABLE_FRAMES:
-                        if action_name in ONE_SHOT_ACTIONS:
-                            action_result = system_controller.execute_action(action_name)
-                            if action_result:
-                                last_action_message = action_result
-                                action_executed = action_result
-                                latched = True
-                                latched_gesture = pred_class
-                                flash_timer = now + 0.6
-                                status_text = f"✔ ISLEM: {action_result}"
-                                status_state = "TRIGGERED"
-                        elif action_name in STEP_ACTIONS:
-                            if now - last_step_trigger_time >= STEP_COOLDOWN:
-                                action_result = system_controller.execute_action(action_name)
-                                if action_result:
-                                    last_action_message = action_result
-                                    action_executed = action_result
-                                    last_step_trigger_time = now
-                                    stable_count = 2
-                                    flash_timer = now + 0.4
-                                    status_text = f"✔ SES AYARLANDI: {action_result}"
-                                    status_state = "TRIGGERED"
-                            else:
-                                wait_left = STEP_COOLDOWN - (now - last_step_trigger_time)
-                                status_text = f"Bekleniyor ({wait_left:.1f}s)..."
-                                status_state = "STEP_WAIT"
-                        else:
-                            status_text = f"{class_name}"
-                            status_state = "NO_ACTION"
-                    else:
-                        status_text = f"Dogrulaniyor [%{int(progress * 100)}]: {class_name}"
-                        status_state = "CONFIRMING"
-
-        # ==================== EKRANA ÇİZİMLER (HUD) ====================
-        COLOR_GREEN = (0, 255, 128)
-        COLOR_YELLOW = (0, 215, 255)
-        COLOR_CYAN = (255, 200, 0)
-        COLOR_GRAY = (120, 130, 140)
-        COLOR_DARK = (18, 22, 28)
-
-        if flash_timer > now:
-            active_color = COLOR_GREEN
-        elif status_state == "TRIGGERED":
-            active_color = COLOR_GREEN
-        elif status_state == "CONFIRMING":
-            active_color = COLOR_YELLOW
-        elif status_state == "LATCHED":
-            active_color = (0, 170, 255)
-        elif status_state == "UNCERTAIN":
-            active_color = COLOR_CYAN
-        else:
-            active_color = COLOR_GRAY
-
-        # --- A. Bounding Box ---
-        box_thickness = 3 if (flash_timer > now or auto_track) else 2
-        cv2.rectangle(frame, (x1, y1), (x2, y2), active_color, box_thickness)
-
-        # Siber Köşe Kancaları (Daha belirgin)
-        c_len = 30
-        cv2.line(frame, (x1, y1), (x1 + c_len, y1), active_color, 4)
-        cv2.line(frame, (x1, y1), (x1, y1 + c_len), active_color, 4)
-        cv2.line(frame, (x2, y1), (x2 - c_len, y1), active_color, 4)
-        cv2.line(frame, (x2, y1), (x2, y1 + c_len), active_color, 4)
-        cv2.line(frame, (x1, y2), (x1 + c_len, y2), active_color, 4)
-        cv2.line(frame, (x1, y2), (x1, y2 - c_len), active_color, 4)
-        cv2.line(frame, (x2, y2), (x2 - c_len, y2), active_color, 4)
-        cv2.line(frame, (x2, y2), (x2, y2 - c_len), active_color, 4)
-
-        # Otomatik Takip Göstergesi (Kutunun üst sol köşesinde minik rozet)
-        mode_badge = "[OTO-TAKIP AKTIF]" if auto_track else "[MANUEL KUTU]"
-        cv2.putText(frame, mode_badge, (x1, y1 - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 200) if auto_track else (180, 180, 180), 1, cv2.LINE_AA)
-
-        # --- B. Doğrulama İlerleme Çubuğu ---
-        if status_state == "CONFIRMING" and progress > 0.0:
-            bar_w = int((x2 - x1) * progress)
-            cv2.rectangle(frame, (x1, y2 + 8), (x2, y2 + 18), COLOR_DARK, -1)
-            cv2.rectangle(frame, (x1, y2 + 8), (x1 + bar_w, y2 + 18), COLOR_YELLOW, -1)
-            cv2.rectangle(frame, (x1, y2 + 8), (x2, y2 + 18), (80, 80, 80), 1)
-
-        # --- C. Durum Etiketi ---
-        badge_w = len(status_text) * 11 + 16
-        cv2.rectangle(frame, (x1, y1 - 32), (x1 + badge_w, y1), COLOR_DARK, -1)
-        cv2.rectangle(frame, (x1, y1 - 32), (x1 + badge_w, y1), active_color, 1)
-        cv2.putText(frame, status_text, (x1 + 8, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.44, active_color, 1, cv2.LINE_AA)
-
-        # --- D. Üst Medya HUD Şeridi ---
-        cv2.rectangle(frame, (0, 0), (w, 52), COLOR_DARK, -1)
-        cv2.line(frame, (0, 52), (w, 52), active_color, 2)
-
-        if action_executed or (flash_timer > now and last_action_message):
-            hud_msg = f">> MEDYADA YAPILAN ISLEM: {last_action_message} <<"
-            hud_color = COLOR_GREEN
-        elif status_state == "LATCHED":
-            hud_msg = f"KILITLENDI: {class_name} | Tekrar komut icin elinizi indirin"
-            hud_color = (0, 200, 255)
-        elif status_state == "CONFIRMING":
-            hud_msg = f"Hareketi Tutun: {class_name} (Doğrulama: %{int(progress * 100)})"
-            hud_color = COLOR_YELLOW
-        elif auto_track and hand_auto_found:
-            hud_msg = f"El Kilitlendi | Boyut: {int(box_size)}px | Eylemi yapmak icin jesti gosterin"
-            hud_color = (0, 255, 200)
-        else:
-            hud_msg = "AirTouch: Elinizi kaldirin, kutu elinize otomatik gelecektir (SPACE: Takip Modu)"
-            hud_color = (180, 190, 200)
-
-        cv2.putText(frame, hud_msg, (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.55, hud_color, 2, cv2.LINE_AA)
-
-        # --- E. Alt Bilgi Çubuğu ---
-        cv2.rectangle(frame, (0, h - 28), (w, h), COLOR_DARK, -1)
-        cv2.line(frame, (0, h - 28), (w, h - 28), (60, 70, 80), 1)
-        track_str = "ACIK" if auto_track else "KAPALI"
-        footer_msg = f"[SPACE] Oto-Takip: {track_str} | [1/2/3] Boyut: {int(box_size)}px | [T] Esik: %{int(confidence_threshold*100)} | [Q] Cikis"
-        cv2.putText(frame, footer_msg, (15, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 190, 200), 1, cv2.LINE_AA)
-
-        # --- F. Model Görünümü ---
-        thumb_64 = cv2.resize((norm_roi * 255).astype(np.uint8), (76, 76))
-        thumb_bgr = cv2.cvtColor(thumb_64, cv2.COLOR_GRAY2BGR)
-        frame[h - 110:h - 34, 15:91] = thumb_bgr
-        cv2.rectangle(frame, (15, h - 110), (91, h - 34), active_color, 1)
-        cv2.putText(frame, "Model Gozu", (16, h - 115), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (190, 190, 190), 1)
-
-        cv2.imshow(WINDOW_TITLE, frame)
-
-        # Tuş Kontrolleri
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord('q'), ord('Q'), 27):
-            break
-        elif key == 32: # SPACE: Otomatik El Takibi Aç / Kapat
-            auto_track = not auto_track
-            print(f"👉 Otomatik El Takibi: {'AÇIK' if auto_track else 'KAPALI'}")
-        elif key == ord('1'): # Orta Boyut
-            box_size = 280.0
-        elif key == ord('2'): # Geniş Boyut
-            box_size = 340.0
-        elif key == ord('3'): # Devasa Boyut
-            box_size = 420.0
-        elif key in (ord('+'), ord('=')):
-            box_size += 25.0
-        elif key in (ord('-'), ord('_')):
-            box_size = max(180.0, box_size - 25.0)
-        elif key in (ord('w'), ord('W')):
-            auto_track = False
-            box_cy -= 25.0
-        elif key in (ord('s'), ord('S')):
-            auto_track = False
-            box_cy += 25.0
-        elif key in (ord('a'), ord('A')):
-            auto_track = False
-            box_cx -= 25.0
-        elif key in (ord('d'), ord('D')):
-            auto_track = False
-            box_cx += 25.0
-        elif key in (ord('c'), ord('C'), ord('r'), ord('R')):
-            auto_track = True
-            box_cx = float(w // 2)
-            box_cy = float(h // 2)
-            box_size = 340.0
-        elif key in (ord('t'), ord('T')):
-            thresholds = [0.70, 0.75, 0.80]
-            curr_idx = thresholds.index(confidence_threshold) if confidence_threshold in thresholds else 1
-            confidence_threshold = thresholds[(curr_idx + 1) % len(thresholds)]
-            print(f"👉 Güven Eşiği: %{confidence_threshold * 100:.0f}")
-
-    cap.release()
-    cv2.destroyAllWindows()
-    print("AirTouch canlı masaüstü penceresi kapatıldı.")
 
 if __name__ == "__main__":
-    run_live_desktop_camera()
+    parser = argparse.ArgumentParser(description="AirTouch Canlı Masaüstü Kamerası")
+    parser.add_argument(
+        "source",
+        nargs="?",
+        default=None,
+        help="Kamera indeksi (varsayılan: 0 - laptop kamerası) veya video akış adresi",
+    )
+    parser.add_argument("--camera", dest="camera_opt", default=None, help="Kamera indeksi/URL")
+    parser.add_argument("--monitor", type=int, default=None, help="Başlangıç ekran numarası (1, 2...)")
+    parser.add_argument("--compact", action="store_true", help="Mini PiP köşe modunda başlat")
+    parser.add_argument("--no-voice", action="store_true", help="Sesli komut dinleyicisini kapalı başlat")
+    args = parser.parse_args()
+    run_live_desktop_camera(
+        camera_source=args.camera_opt if args.camera_opt is not None else args.source,
+        monitor_index=args.monitor,
+        compact_override=True if args.compact else None,
+        voice_override=False if args.no_voice else None,
+    )

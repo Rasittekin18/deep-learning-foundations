@@ -40,7 +40,13 @@ venv.bak/
 *.pt
 *.pth
 *.onnx
+*.task
 !AirTouch/models/airtouch_model.pth
+!AirTouch/models/airtouch_landmark_model.pth
+AirTouch/models/vosk-model-*/
+
+# Test cache
+.pytest_cache/
 
 # IDE / Editor files
 .vscode/
